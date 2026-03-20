@@ -143,6 +143,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     scrapeDepop,
     generateRecommendation,
     sendResults,
+    client,
   });
 });
 
