@@ -145,8 +145,9 @@ async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDep
       const rec = await generateRecommendation(anthropic, resolvedQuery, ebay, depop, session.imageUrl || session.imageAttachment, isFullListing);
       session.status = 'done';
 
-      // Post results to channel (no interaction needed — just use the channel directly)
-      await sendResults(interaction.channel, rec, ebay, depop, resolvedQuery, session.imageUrl || session.imageAttachment);
+      // Fetch channel directly via client to avoid expired interaction
+      const chan = client ? await client.channels.fetch(interaction.channelId).catch(() => interaction.channel) : interaction.channel;
+      await sendResults(chan, rec, ebay, depop, resolvedQuery, session.imageUrl || session.imageAttachment);
 
       // Update dashboard via direct message edit (not interaction)
       if (client) await refreshDashboardMessage(client, session);
