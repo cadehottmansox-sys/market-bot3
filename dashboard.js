@@ -1,11 +1,6 @@
 const {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder,
+  ModalBuilder, TextInputBuilder, TextInputStyle,
 } = require('discord.js');
 
 const sessions = new Map();
@@ -33,31 +28,31 @@ function buildDashboard(session) {
   const lines = [];
   const hasItem = session.itemName || session.itemUrl;
   if (hasItem) {
-    lines.push('🏷️ **Slot 1 — Item**');
-    lines.push('✅ ' + (session.itemName || session.itemUrl));
+    lines.push('\u{1F3F7}\uFE0F **Slot 1 \u2014 Item**');
+    lines.push('\u2705 ' + (session.itemName || session.itemUrl));
   } else {
-    lines.push('🏷️ **Slot 1 — Item Name or Link**');
-    lines.push('⬜ Nothing entered yet');
+    lines.push('\u{1F3F7}\uFE0F **Slot 1 \u2014 Item Name or Link**');
+    lines.push('\u2B1C Nothing entered yet');
   }
   lines.push('');
   if (session.imageUrl || session.imageAttachment) {
-    lines.push('📸 **Slot 2 — Item Photo** *(optional)*');
-    lines.push('✅ Photo uploaded');
+    lines.push('\u{1F4F8} **Slot 2 \u2014 Item Photo** *(optional)*');
+    lines.push('\u2705 Photo uploaded');
   } else {
-    lines.push('📸 **Slot 2 — Item Photo** *(optional)*');
-    lines.push('⬜ Upload a photo to improve accuracy');
+    lines.push('\u{1F4F8} **Slot 2 \u2014 Item Photo** *(optional)*');
+    lines.push('\u2B1C Upload a photo to improve accuracy');
   }
   lines.push('');
-  if (session.status === 'searching') lines.push('⏳ Searching eBay & Depop for recent sales...');
-  else if (session.status === 'done') lines.push('✅ Analysis complete — results posted below');
-  else if (hasItem) lines.push('Ready! Hit **🔍 Find Comps** to search recent sales.');
+  if (session.status === 'searching') lines.push('\u23F3 Searching eBay & Depop...');
+  else if (session.status === 'done') lines.push('\u2705 Analysis complete \u2014 results posted below');
+  else if (hasItem) lines.push('Ready! Hit **\u{1F50D} Find Comps** to search recent sales.');
   else lines.push('Enter an item name, link, or photo to get started.');
 
   return new EmbedBuilder()
-    .setTitle('🏷️ ResellBot Dashboard')
+    .setTitle('\u{1F3F7}\uFE0F ResellBot Dashboard')
     .setDescription(lines.join('\n'))
     .setColor(session.status === 'done' ? 0x00c851 : session.status === 'searching' ? 0xffaa00 : 0x5865f2)
-    .setFooter({ text: 'ResellBot • eBay & Depop Comp Finder' });
+    .setFooter({ text: 'ResellBot \u2022 eBay & Depop Comp Finder' });
 }
 
 function buildButtons(session) {
@@ -65,18 +60,18 @@ function buildButtons(session) {
   const isSearching = session.status === 'searching';
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('rb_enter_item')
-      .setLabel(hasItem ? '✏️ Edit Item' : '✏️ Enter Item Name / Link')
+      .setLabel(hasItem ? 'Edit Item' : 'Enter Item Name / Link')
       .setStyle(hasItem ? ButtonStyle.Secondary : ButtonStyle.Success).setDisabled(isSearching),
     new ButtonBuilder().setCustomId('rb_upload_photo')
-      .setLabel(session.imageUrl || session.imageAttachment ? '📸 Re-upload Photo' : '📸 Upload Photo (optional)')
+      .setLabel(session.imageUrl || session.imageAttachment ? 'Re-upload Photo' : 'Upload Photo (optional)')
       .setStyle(ButtonStyle.Primary).setDisabled(isSearching),
   );
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('rb_find_comps').setLabel('🔍 Find Comps')
+    new ButtonBuilder().setCustomId('rb_find_comps').setLabel('Find Comps')
       .setStyle(ButtonStyle.Danger).setDisabled(!hasItem || isSearching),
-    new ButtonBuilder().setCustomId('rb_full_listing').setLabel('📝 Generate Full Listing')
+    new ButtonBuilder().setCustomId('rb_full_listing').setLabel('Generate Full Listing')
       .setStyle(ButtonStyle.Success).setDisabled(!hasItem || isSearching),
-    new ButtonBuilder().setCustomId('rb_clear').setLabel('🗑️ Clear')
+    new ButtonBuilder().setCustomId('rb_clear').setLabel('Clear')
       .setStyle(ButtonStyle.Secondary).setDisabled(isSearching),
   );
   return [row1, row2];
@@ -90,6 +85,14 @@ async function sendDashboard(channel, userId) {
   return msg;
 }
 
+async function safeUpdate(interaction, session) {
+  try {
+    await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) });
+  } catch (e) {
+    console.warn('safeUpdate failed:', e.message);
+  }
+}
+
 async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDepop, generateRecommendation, sendResults }) {
   const userId = interaction.user.id;
   const session = getSession(userId);
@@ -99,7 +102,7 @@ async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDep
     const input = new TextInputBuilder().setCustomId('item_input')
       .setLabel('Item name, eBay/Depop link, or search query')
       .setStyle(TextInputStyle.Short)
-      .setPlaceholder('e.g. Nike Dunk Low Panda sz10 — or paste a URL')
+      .setPlaceholder('e.g. Nike Dunk Low Panda sz10')
       .setRequired(true).setValue(session.itemName || session.itemUrl || '');
     modal.addComponents(new ActionRowBuilder().addComponents(input));
     return interaction.showModal(modal);
@@ -120,22 +123,23 @@ async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDep
   }
 
   if (interaction.isButton() && interaction.customId === 'rb_upload_photo') {
-    await interaction.reply({ content: '📸 **Send your photo now** as a message in this channel.', ephemeral: true });
     session.awaitingPhoto = true;
+    await interaction.reply({ content: 'Send your photo now as a message in this channel.', ephemeral: true });
     return;
   }
 
   if (interaction.isButton() && interaction.customId === 'rb_clear') {
     clearSession(userId);
     const s = getSession(userId);
-    await interaction.update({ embeds: [buildDashboard(s)], components: buildButtons(s) });
+    try { await interaction.update({ embeds: [buildDashboard(s)], components: buildButtons(s) }); } catch (e) { console.warn(e.message); }
     return;
   }
 
   if (interaction.isButton() && (interaction.customId === 'rb_find_comps' || interaction.customId === 'rb_full_listing')) {
     const isFullListing = interaction.customId === 'rb_full_listing';
     session.status = 'searching';
-    await interaction.update({ embeds: [buildDashboard(session)], components: buildButtons(session) });
+    try { await interaction.update({ embeds: [buildDashboard(session)], components: buildButtons(session) }); } catch (e) { console.warn(e.message); }
+
     try {
       let resolvedQuery = session.itemName || session.itemUrl || '';
       if ((session.imageUrl || session.imageAttachment) && !session.itemName) {
@@ -147,13 +151,14 @@ async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDep
       const depop = depopRes.status === 'fulfilled' ? depopRes.value : [];
       const rec = await generateRecommendation(anthropic, resolvedQuery, ebay, depop, session.imageUrl || session.imageAttachment, isFullListing);
       session.status = 'done';
-      await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) });
+      // Update the dashboard embed silently — don't crash if it fails
+      try { await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) }); } catch (_) {}
       await sendResults(interaction.channel, rec, ebay, depop, resolvedQuery, session.imageUrl || session.imageAttachment);
     } catch (err) {
-      console.error('Search error:', err);
+      console.error('Search error:', err.message);
       session.status = 'idle';
-      await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) }).catch(() => {});
-      await interaction.followUp({ content: '❌ Error: ' + err.message, ephemeral: true }).catch(() => {});
+      try { await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) }); } catch (_) {}
+      try { await interaction.followUp({ content: 'Error: ' + err.message, ephemeral: true }); } catch (_) {}
     }
   }
 }
