@@ -27,32 +27,20 @@ function clearSession(userId) {
 function buildDashboard(session) {
   const lines = [];
   const hasItem = session.itemName || session.itemUrl;
-  if (hasItem) {
-    lines.push('\u{1F3F7}\uFE0F **Slot 1 \u2014 Item**');
-    lines.push('\u2705 ' + (session.itemName || session.itemUrl));
-  } else {
-    lines.push('\u{1F3F7}\uFE0F **Slot 1 \u2014 Item Name or Link**');
-    lines.push('\u2B1C Nothing entered yet');
-  }
+  lines.push(hasItem ? ('**Item:** ' + (session.itemName || session.itemUrl)) : 'No item entered yet');
   lines.push('');
-  if (session.imageUrl || session.imageAttachment) {
-    lines.push('\u{1F4F8} **Slot 2 \u2014 Item Photo** *(optional)*');
-    lines.push('\u2705 Photo uploaded');
-  } else {
-    lines.push('\u{1F4F8} **Slot 2 \u2014 Item Photo** *(optional)*');
-    lines.push('\u2B1C Upload a photo to improve accuracy');
-  }
+  lines.push(session.imageUrl ? '**Photo:** Uploaded' : '**Photo:** None');
   lines.push('');
-  if (session.status === 'searching') lines.push('\u23F3 Searching eBay & Depop...');
-  else if (session.status === 'done') lines.push('\u2705 Analysis complete \u2014 results posted below');
-  else if (hasItem) lines.push('Ready! Hit **\u{1F50D} Find Comps** to search recent sales.');
-  else lines.push('Enter an item name, link, or photo to get started.');
+  if (session.status === 'searching') lines.push('Searching eBay & Depop...');
+  else if (session.status === 'done') lines.push('Done! Results posted below.');
+  else if (hasItem) lines.push('Hit **Find Comps** to search recent sales.');
+  else lines.push('Enter an item name or link to get started.');
 
   return new EmbedBuilder()
-    .setTitle('\u{1F3F7}\uFE0F ResellBot Dashboard')
+    .setTitle('ResellBot Dashboard')
     .setDescription(lines.join('\n'))
     .setColor(session.status === 'done' ? 0x00c851 : session.status === 'searching' ? 0xffaa00 : 0x5865f2)
-    .setFooter({ text: 'ResellBot \u2022 eBay & Depop Comp Finder' });
+    .setFooter({ text: 'ResellBot - eBay & Depop Comp Finder' });
 }
 
 function buildButtons(session) {
@@ -63,7 +51,7 @@ function buildButtons(session) {
       .setLabel(hasItem ? 'Edit Item' : 'Enter Item Name / Link')
       .setStyle(hasItem ? ButtonStyle.Secondary : ButtonStyle.Success).setDisabled(isSearching),
     new ButtonBuilder().setCustomId('rb_upload_photo')
-      .setLabel(session.imageUrl || session.imageAttachment ? 'Re-upload Photo' : 'Upload Photo (optional)')
+      .setLabel(session.imageUrl ? 'Re-upload Photo' : 'Upload Photo (optional)')
       .setStyle(ButtonStyle.Primary).setDisabled(isSearching),
   );
   const row2 = new ActionRowBuilder().addComponents(
@@ -85,15 +73,19 @@ async function sendDashboard(channel, userId) {
   return msg;
 }
 
-async function safeUpdate(interaction, session) {
+// Update dashboard by fetching the original message directly
+async function refreshDashboardMessage(client, session) {
+  if (!session.dashboardMessageId || !session.dashboardChannelId) return;
   try {
-    await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) });
+    const chan = await client.channels.fetch(session.dashboardChannelId);
+    const msg = await chan.messages.fetch(session.dashboardMessageId);
+    await msg.edit({ embeds: [buildDashboard(session)], components: buildButtons(session) });
   } catch (e) {
-    console.warn('safeUpdate failed:', e.message);
+    console.warn('Dashboard refresh failed:', e.message);
   }
 }
 
-async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDepop, generateRecommendation, sendResults }) {
+async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDepop, generateRecommendation, sendResults, client }) {
   const userId = interaction.user.id;
   const session = getSession(userId);
 
@@ -116,8 +108,7 @@ async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDep
     try {
       await interaction.update({ embeds: [buildDashboard(session)], components: buildButtons(session) });
     } catch (e) {
-      console.error('modal update err:', e.message);
-      try { await interaction.reply({ embeds: [buildDashboard(session)], components: buildButtons(session) }); } catch (_) {}
+      await interaction.reply({ embeds: [buildDashboard(session)], components: buildButtons(session) }).catch(() => {});
     }
     return;
   }
@@ -131,14 +122,16 @@ async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDep
   if (interaction.isButton() && interaction.customId === 'rb_clear') {
     clearSession(userId);
     const s = getSession(userId);
-    try { await interaction.update({ embeds: [buildDashboard(s)], components: buildButtons(s) }); } catch (e) { console.warn(e.message); }
+    await interaction.update({ embeds: [buildDashboard(s)], components: buildButtons(s) }).catch(() => {});
     return;
   }
 
   if (interaction.isButton() && (interaction.customId === 'rb_find_comps' || interaction.customId === 'rb_full_listing')) {
     const isFullListing = interaction.customId === 'rb_full_listing';
     session.status = 'searching';
-    try { await interaction.update({ embeds: [buildDashboard(session)], components: buildButtons(session) }); } catch (e) { console.warn(e.message); }
+
+    // Acknowledge the button click immediately — this is the ONLY response to this interaction
+    await interaction.update({ embeds: [buildDashboard(session)], components: buildButtons(session) }).catch(() => {});
 
     try {
       let resolvedQuery = session.itemName || session.itemUrl || '';
@@ -151,14 +144,18 @@ async function handleInteraction(interaction, { anthropic, scrapeEbay, scrapeDep
       const depop = depopRes.status === 'fulfilled' ? depopRes.value : [];
       const rec = await generateRecommendation(anthropic, resolvedQuery, ebay, depop, session.imageUrl || session.imageAttachment, isFullListing);
       session.status = 'done';
-      // Update the dashboard embed silently — don't crash if it fails
-      try { await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) }); } catch (_) {}
+
+      // Post results to channel (no interaction needed — just use the channel directly)
       await sendResults(interaction.channel, rec, ebay, depop, resolvedQuery, session.imageUrl || session.imageAttachment);
+
+      // Update dashboard via direct message edit (not interaction)
+      if (client) await refreshDashboardMessage(client, session);
+
     } catch (err) {
       console.error('Search error:', err.message);
       session.status = 'idle';
-      try { await interaction.editReply({ embeds: [buildDashboard(session)], components: buildButtons(session) }); } catch (_) {}
-      try { await interaction.followUp({ content: 'Error: ' + err.message, ephemeral: true }); } catch (_) {}
+      if (client) await refreshDashboardMessage(client, session);
+      await interaction.channel.send('Error: ' + err.message).catch(() => {});
     }
   }
 }
