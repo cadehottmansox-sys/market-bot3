@@ -225,7 +225,8 @@ Return ONLY raw JSON (no markdown fences):
 
 // ─── Results embeds ───────────────────────────────────────────────────────────
 
-async function sendResults(channel, rec, ebayListings, depopListings, query, imageUrl) {
+async function sendResults(channelOrId, rec, ebayListings, depopListings, query, imageUrl) {
+  const channel = (typeof channelOrId === 'string') ? await client.channels.fetch(channelOrId) : channelOrId;
   const embeds = [];
 
   // 1. Pricing overview
@@ -295,7 +296,8 @@ async function sendResults(channel, rec, ebayListings, depopListings, query, ima
 
 // ─── Listing photo embed ──────────────────────────────────────────────────────
 
-async function sendListingPhotos(channel, ebayListings, depopListings, query, rec) {
+async function sendListingPhotos(channelOrId, ebayListings, depopListings, query, rec) {
+  const channel = (typeof channelOrId === 'string') ? await client.channels.fetch(channelOrId) : channelOrId;
   // Collect images from sold listings (these are real sold photos = great references)
   const allImages = [
     ...ebayListings.filter(l => l.imageUrl).map(l => ({ url: l.imageUrl, source: 'eBay', title: l.title, price: l.price })),
