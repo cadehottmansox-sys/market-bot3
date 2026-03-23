@@ -227,4 +227,33 @@ function getPriceStats(listings) {
   };
 }
 
-module.exports = { scrapeEbay, scrapeDepop, getPriceStats, upsizeEbayImage };
+
+// ─── Fetch all photos from a single eBay item listing page ───────────────────
+// Returns array of full-size image URLs from one listing
+async function fetchListingPhotos(itemUrl) {
+  if (!itemUrl) return [];
+  try {
+    const { html, status } = await fetchHTML(itemUrl);
+    if (status !== 200) return [];
+    // Each unique image hash = one photo. Extract all unique hashes.
+    const picPattern = /https:\/\/i\.ebayimg\.com\/images\/g\/([A-Za-z0-9~_-]+)\/s-l\d+\.(?:webp|jpg)/g;
+    const seen = new Set();
+    const photos = [];
+    let m;
+    while ((m = picPattern.exec(html)) !== null) {
+      const hash = m[1];
+      if (!seen.has(hash)) {
+        seen.add(hash);
+        // Use s-l1600 for full size, fall back to s-l500
+        photos.push('https://i.ebayimg.com/images/g/' + hash + '/s-l1600.webp');
+      }
+    }
+    console.log('[fetchListingPhotos] Found ' + photos.length + ' photos from ' + itemUrl);
+    return photos.slice(0, 10); // max 10 photos per listing
+  } catch (e) {
+    console.error('[fetchListingPhotos] Error:', e.message);
+    return [];
+  }
+}
+
+module.exports = { scrapeEbay, scrapeDepop, getPriceStats, upsizeEbayImage, fetchListingPhotos };
