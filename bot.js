@@ -1,16 +1,15 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, Events, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, MessageFlags } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
-const { scrapeEbay, scrapeDepop, getPriceStats } = require('./scraper');
+const { scrapeEbay, scrapeDepop, getPriceStats, fetchListingPhotos } = require('./scraper');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const sessions = new Map();
-const resultOwners = new Map();
 
 function getSession(userId) {
-  if (!sessions.has(userId)) sessions.set(userId, { itemName: null, status: 'idle', msgId: null, channelId: null });
+  if (!sessions.has(userId)) sessions.set(userId, { itemName: null, status: 'idle', msgId: null, channelId: null, photoListingIndex: 0, ebayListings: [] });
   return sessions.get(userId);
 }
 
@@ -37,7 +36,7 @@ function buildEmbed(session) {
       hasItem ? '🏷️ **Slot 1 — Item**\n✅ ' + session.itemName : '🏷️ **Slot 1 — Item Name**\n⬜ Nothing entered yet',
       '',
       session.status === 'searching' ? '⏳ Searching eBay & Depop for recent sales...' :
-      session.status === 'done' ? '✅ Analysis complete — check your results below!' :
+      session.status === 'done' ? '✅ Analysis complete — results sent to you!' :
       hasItem ? '🚀 Ready! Hit **🔍 Find Comps** or **📝 Full Listing**.' : '👆 Click **✏️ Enter Item** to get started.',
     ].join('\n'))
     .setColor(session.status === 'done' ? 0x00c851 : session.status === 'searching' ? 0xffaa00 : 0x5865f2)
@@ -55,27 +54,11 @@ function buildButtons(session) {
   )];
 }
 
-function dismissButton(userId) {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('rb_delete_' + userId).setLabel('🗑️ Dismiss').setStyle(ButtonStyle.Secondary),
-  )];
-}
-
 client.on(Events.InteractionCreate, async (interaction) => {
   const userId = interaction.user.id;
   const session = getSession(userId);
 
-  // Dismiss button — only works for whoever ran the search
-  if (interaction.isButton() && interaction.customId.startsWith('rb_delete_')) {
-    const ownerId = interaction.customId.replace('rb_delete_', '');
-    if (interaction.user.id !== ownerId) {
-      return interaction.reply({ content: '❌ Only the person who ran this search can dismiss it.', flags: MessageFlags.Ephemeral });
-    }
-    await interaction.message.delete().catch(() => {});
-    await interaction.deferUpdate().catch(() => {});
-    return;
-  }
-
+  // /marketdashboard — persistent dashboard visible to everyone
   if (interaction.isChatInputCommand() && interaction.commandName === 'marketdashboard') {
     const msg = await interaction.reply({ embeds: [buildEmbed(session)], components: buildButtons(session), fetchReply: true });
     session.msgId = msg.id;
@@ -83,6 +66,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // Enter item button
   if (interaction.isButton() && interaction.customId === 'rb_enter') {
     const modal = new ModalBuilder().setCustomId('rb_modal').setTitle('✏️ Enter Item Details');
     modal.addComponents(new ActionRowBuilder().addComponents(
@@ -93,33 +77,49 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.showModal(modal);
   }
 
+  // Modal submit
   if (interaction.isModalSubmit() && interaction.customId === 'rb_modal') {
     session.itemName = interaction.fields.fields.get('item')?.value?.trim() || '';
     session.status = 'idle';
     session.channelId = interaction.channelId;
+    session.photoListingIndex = 0;
+    session.ebayListings = [];
     const msg = await interaction.reply({ embeds: [buildEmbed(session)], components: buildButtons(session), fetchReply: true });
     session.msgId = msg.id;
     return;
   }
 
+  // Clear
   if (interaction.isButton() && interaction.customId === 'rb_clear') {
-    session.itemName = null; session.status = 'idle';
+    session.itemName = null; session.status = 'idle'; session.ebayListings = []; session.photoListingIndex = 0;
     await interaction.update({ embeds: [buildEmbed(session)], components: buildButtons(session) });
     return;
   }
 
+  // Find new photos — cycle to next listing with photos
+  if (interaction.isButton() && interaction.customId === 'rb_newphotos') {
+    await interaction.deferUpdate();
+    session.photoListingIndex = (session.photoListingIndex || 0) + 1;
+    const chan = await client.channels.fetch(interaction.channelId);
+    await sendPhotos(chan, session, userId, true);
+    return;
+  }
+
+  // Find Comps or Full Listing
   if (interaction.isButton() && (interaction.customId === 'rb_comps' || interaction.customId === 'rb_listing')) {
     const isFullListing = interaction.customId === 'rb_listing';
     const query = session.itemName;
     const channelId = interaction.channelId;
     session.status = 'searching';
     session.channelId = channelId;
+    session.photoListingIndex = 0;
     await interaction.update({ embeds: [buildEmbed(session)], components: buildButtons(session) });
     runSearch(userId, query, channelId, isFullListing).catch(async err => {
       console.error('Search error:', err.message);
       session.status = 'idle';
       const chan = await client.channels.fetch(channelId).catch(() => null);
-      if (chan) chan.send({ content: '❌ Error: ' + err.message, components: dismissButton(userId) }).catch(() => {});
+      // Error only visible to user
+      if (chan) chan.send({ content: '❌ Error: ' + err.message, flags: MessageFlags.Ephemeral }).catch(() => {});
     });
   }
 });
@@ -133,88 +133,29 @@ async function runSearch(userId, query, channelId, isFullListing) {
   const depop = depopRes.status === 'fulfilled' ? depopRes.value : [];
   console.log('eBay: ' + ebay.length + ' Depop: ' + depop.length);
 
-  // Pick best listing photos using Claude Vision
-  const bestPhotos = await pickBestPhotos(ebay, query);
-  console.log('Best photos selected: ' + bestPhotos.length);
+  // Store listings for photo cycling
+  session.ebayListings = ebay.filter(l => l.itemUrl);
 
   const rec = await generateRec(query, ebay, depop, isFullListing);
   session.status = 'done';
 
+  // Update dashboard (stays visible to everyone)
   if (session.msgId) {
     const msg = await chan.messages.fetch(session.msgId).catch(() => null);
     if (msg) msg.edit({ embeds: [buildEmbed(session)], components: buildButtons(session) }).catch(() => {});
   }
 
-  await postResults(chan, rec, ebay, depop, query, userId, bestPhotos);
+  // Send ALL results as ephemeral — only visible to the user who requested
+  await sendResultsEphemeral(chan, rec, ebay, depop, query, userId);
+  await sendPhotos(chan, session, userId, false);
 }
 
-// Use Claude Vision to pick 4-5 clean photos (plain background, item only, no packaging)
-async function pickBestPhotos(ebayListings, query) {
-  const candidates = ebayListings.filter(l => l.imageUrl).slice(0, 12);
-  if (candidates.length === 0) return [];
-
-  try {
-    // Build multi-image prompt for Claude to score all at once
-    const imageContent = candidates.slice(0, 8).map((l, i) => ([
-      { type: 'image', source: { type: 'url', url: l.imageUrl } },
-      { type: 'text', text: 'Photo ' + (i+1) + ' (sold $' + l.price + ')' },
-    ])).flat();
-
-    imageContent.push({ type: 'text', text: 'You are helping a reseller pick the best listing photos for ' + query + '. Rate each photo 1-10 based on: clean plain background (white/grey preferred), item clearly visible, no packaging boxes or bags, no mannequins, good lighting, professional look. Return ONLY a JSON array of objects: [{"index":1,"score":8,"reason":"clean white bg"},{"index":2,"score":3,"reason":"has packaging box"},...] for all ' + candidates.slice(0,8).length + ' photos.' });
-
-    const r = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 400,
-      messages: [{ role: 'user', content: imageContent }],
-    });
-
-    const raw = r.content[0].text.trim().replace(/```json|```/g, '').trim();
-    const scores = JSON.parse(raw);
-
-    // Sort by score descending, take top 4-5 with score >= 5
-    const good = scores
-      .filter(s => s.score >= 5)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5)
-      .map(s => ({ ...candidates[s.index - 1], score: s.score, reason: s.reason }));
-
-    return good.length > 0 ? good : candidates.slice(0, 4).map(c => ({ ...c, score: 5, reason: 'auto-selected' }));
-  } catch (e) {
-    console.error('Photo scoring error:', e.message);
-    // Fallback: just return first 4
-    return candidates.slice(0, 4).map(c => ({ ...c, score: 5, reason: 'auto-selected' }));
-  }
-}
-
-async function generateRec(query, ebay, depop, isFullListing) {
+// Send results — ephemeral so only the requester sees them
+async function sendResultsEphemeral(chan, rec, ebay, depop, query, userId) {
   const es = getPriceStats(ebay);
   const ds = getPriceStats(depop);
-  const stats = [
-    es ? 'eBay: avg $' + es.avg + ', median $' + es.median + ', range $' + es.min + '-$' + es.max + ' (' + es.count + ' sales)' : 'eBay: no data',
-    ds ? 'Depop: avg $' + ds.avg + ', median $' + ds.median : 'Depop: no data',
-  ].join('\n');
-  const comps = ebay.slice(0,6).map((l,i) => (i+1)+'. "'+l.title+'" - $'+l.price+' ('+l.condition+')').join('\n') || 'No comps found';
 
-  const prompt = isFullListing
-    ? 'You are an expert eBay reseller using 2025 best practices. Create a complete optimized listing.\n\nItem: ' + query + '\nSold price data:\n' + stats + '\neBay sold comps:\n' + comps + '\n\nReturn ONLY raw JSON (no markdown):\n{"suggestedPrice":49.99,"priceRangeMin":40.00,"priceRangeMax":60.00,"title":"SEO title under 80 chars with brand model color size","condition":"Pre-Owned","description":"3-4 natural paragraphs like a real reseller. Include: what the item is, condition details, what is included, shipping policy, Buy It Now with Best Offer. Do NOT sound like AI.","hashtags":["#brand","#model","#resell"],"tips":["Promote at 3.5% minimum","Enable Best Offer","Free shipping built into price","Relist with tweaks if no views after 48hrs"],"platform":"Specific platform recommendation with reason"}'
-    : 'You are an expert eBay reseller. Give quick pricing advice.\n\nItem: ' + query + '\nSold price data:\n' + stats + '\neBay sold comps:\n' + comps + '\n\nReturn ONLY raw JSON (no markdown):\n{"suggestedPrice":49.99,"priceRangeMin":40.00,"priceRangeMax":60.00,"title":"SEO title under 80 chars","condition":"Pre-Owned","tips":["tip1","tip2","tip3"],"platform":"recommendation with reason","marketNote":"one sentence on demand/trend"}';
-
-  const r = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: isFullListing ? 1200 : 600,
-    messages: [{ role: 'user', content: prompt }],
-  });
-  const raw = r.content[0].text.trim().replace(/```json|```/g, '').trim();
-  try { return JSON.parse(raw); }
-  catch { return { suggestedPrice: '?', priceRangeMin: '?', priceRangeMax: '?', title: query, condition: 'Pre-Owned', tips: [], platform: 'eBay' }; }
-}
-
-async function postResults(chan, rec, ebay, depop, query, userId, bestPhotos) {
-  const es = getPriceStats(ebay);
-  const ds = getPriceStats(depop);
-  const btn = dismissButton(userId);
-
-  // 1. Pricing
+  // Pricing embed
   const e1 = new EmbedBuilder()
     .setTitle('💰 Pricing Analysis — ' + query.slice(0,50))
     .setColor(0x00c851)
@@ -224,53 +165,89 @@ async function postResults(chan, rec, ebay, depop, query, userId, bestPhotos) {
       { name: '📦 Condition', value: rec.condition || 'Pre-Owned', inline: true },
       { name: '📝 Optimized Title', value: '`' + (rec.title || query) + '`' },
       { name: '🛒 Platform', value: rec.platform || 'eBay' },
-    ).setTimestamp().setFooter({ text: ebay.length + ' eBay + ' + depop.length + ' Depop comps • Hit Dismiss to hide results' });
+    ).setTimestamp().setFooter({ text: ebay.length + ' eBay + ' + depop.length + ' Depop comps' });
   if (rec.marketNote) e1.addFields({ name: '📈 Market Note', value: rec.marketNote });
   if (rec.tips?.length) e1.addFields({ name: '💡 Tips', value: rec.tips.map(t => '• ' + t).join('\n') });
-  await chan.send({ embeds: [e1], components: btn });
 
-  // 2. Comps
-  await chan.send({ embeds: [
-    new EmbedBuilder().setTitle('📦 eBay — Recent Sold').setColor(0xe53238)
-      .setDescription(ebay.length ? ebay.slice(0,8).map((l,i) => '**'+(i+1)+'.** $'+l.price+' — '+l.title.slice(0,55)+' *('+l.condition+')*').join('\n') : '_No eBay results_')
-      .setFooter({ text: es ? 'Avg $'+es.avg+' • Median $'+es.median+' • '+es.count+' sales' : 'No data' }),
-    new EmbedBuilder().setTitle('🌸 Depop — Recent Sold').setColor(0xff2d55)
-      .setDescription(depop.length ? depop.slice(0,6).map((l,i) => '**'+(i+1)+'.** $'+l.price+' — '+l.title.slice(0,55)).join('\n') : '_No Depop results_')
-      .setFooter({ text: ds ? 'Avg $'+ds.avg+' • Median $'+ds.median : 'No data' }),
-  ], components: btn });
+  // Comps
+  const e2 = new EmbedBuilder().setTitle('📦 eBay — Recent Sold').setColor(0xe53238)
+    .setDescription(ebay.length ? ebay.slice(0,8).map((l,i) => '**'+(i+1)+'.** $'+l.price+' — '+l.title.slice(0,55)+' *('+l.condition+')*').join('\n') : '_No eBay results_')
+    .setFooter({ text: es ? 'Avg $'+es.avg+' • Median $'+es.median+' • '+es.count+' sales' : 'No data' });
+  const e3 = new EmbedBuilder().setTitle('🌸 Depop — Recent Sold').setColor(0xff2d55)
+    .setDescription(depop.length ? depop.slice(0,6).map((l,i) => '**'+(i+1)+'.** $'+l.price+' — '+l.title.slice(0,55)).join('\n') : '_No Depop results_')
+    .setFooter({ text: ds ? 'Avg $'+ds.avg+' • Median $'+ds.median : 'No data' });
 
-  // 3. Full listing description
+  // Send pricing + comps as ephemeral (flags: MessageFlags.Ephemeral)
+  await chan.send({ embeds: [e1, e2, e3], flags: MessageFlags.Ephemeral });
+
+  // Full listing description
   if (rec.description) {
-    const e3 = new EmbedBuilder().setTitle('📋 Copy-Paste Listing Description').setColor(0x5865f2)
+    const e4 = new EmbedBuilder().setTitle('📋 Copy-Paste Listing Description').setColor(0x5865f2)
       .setDescription('```\n' + rec.description.slice(0,3900) + '\n```');
-    if (rec.hashtags?.length) e3.addFields({ name: '#️⃣ Hashtags', value: rec.hashtags.join(' ') });
-    await chan.send({ embeds: [e3], components: btn });
+    if (rec.hashtags?.length) e4.addFields({ name: '#️⃣ Hashtags', value: rec.hashtags.join(' ') });
+    await chan.send({ embeds: [e4], flags: MessageFlags.Ephemeral });
+  }
+}
+
+// Send photos from ONE listing — all photos from that single listing
+async function sendPhotos(chan, session, userId, isNewPhotoRequest) {
+  const listings = (session.ebayListings || []).filter(l => l.itemUrl);
+  if (listings.length === 0) return;
+
+  const idx = session.photoListingIndex || 0;
+  if (idx >= listings.length) {
+    await chan.send({ content: '📷 No more listings with photos to try!', flags: MessageFlags.Ephemeral });
+    return;
   }
 
-  // 4. Best listing photos — Claude-selected, clean background, no packaging
-  if (bestPhotos.length > 0) {
-    // Send up to 4 photos in one embed message (Discord allows up to 4 images per message via multiple embeds)
-    const photoEmbeds = bestPhotos.slice(0, 4).map((p, i) =>
-      new EmbedBuilder()
-        .setTitle(i === 0 ? '📸 Best Listing Photos (' + bestPhotos.length + ' selected from real sold listings)' : '\u200b')
-        .setDescription(i === 0 ? '✅ AI-filtered: clean backgrounds, no packaging, ready to use as listing photo inspiration.' : null)
-        .setImage(p.imageUrl)
-        .setColor(0x2b2d31)
-        .setFooter({ text: '⭐ Score: ' + p.score + '/10 — Sold $' + p.price + ' — ' + p.title.slice(0,50) })
-    );
-    await chan.send({ embeds: photoEmbeds, components: btn });
-  } else {
-    // No photos found — give tips instead
-    await chan.send({ embeds: [
-      new EmbedBuilder().setTitle('📷 No Matching Photos Found').setColor(0xffaa00)
-        .setDescription('No clean listing photos were found in the sold results. Here are tips for shooting your own:')
-        .addFields(
-          { name: '📱 Setup', value: 'Plain white/grey background, natural window light' },
-          { name: '📐 Angles', value: 'Front, back, both sides, close-up of tags/labels, any flaws' },
-          { name: '🚫 Avoid', value: 'Flash, clutter, packaging, stock photos' },
-        )
-    ], components: btn });
+  const listing = listings[idx];
+  console.log('Fetching photos from listing ' + (idx+1) + ': ' + listing.itemUrl);
+
+  const photos = await fetchListingPhotos(listing.itemUrl);
+  if (photos.length === 0) {
+    // Try next listing automatically
+    session.photoListingIndex = idx + 1;
+    return sendPhotos(chan, session, userId, isNewPhotoRequest);
   }
+
+  // Build one embed per photo (max 4), all from the same listing
+  const photoEmbeds = photos.slice(0, 4).map((url, i) =>
+    new EmbedBuilder()
+      .setTitle(i === 0 ? '📸 Listing Photos — ' + listing.title.slice(0, 45) + ' ($' + listing.price + ')' : '\u200b')
+      .setDescription(i === 0 ? 'All photos from one real sold listing. Hit **🔄 New Photos** for a different listing.' : null)
+      .setImage(url)
+      .setColor(0x2b2d31)
+      .setFooter({ text: 'Photo ' + (i+1) + ' of ' + Math.min(photos.length, 4) + ' • Sold $' + listing.price })
+  );
+
+  const newPhotosBtn = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('rb_newphotos').setLabel('🔄 New Photos').setStyle(ButtonStyle.Secondary),
+  );
+
+  await chan.send({ embeds: photoEmbeds, components: [newPhotosBtn], flags: MessageFlags.Ephemeral });
+}
+
+async function generateRec(query, ebay, depop, isFullListing) {
+  const es = getPriceStats(ebay);
+  const ds = getPriceStats(depop);
+  const stats = [
+    es ? 'eBay: avg $'+es.avg+', median $'+es.median+', range $'+es.min+'-$'+es.max+' ('+es.count+' sales)' : 'eBay: no data',
+    ds ? 'Depop: avg $'+ds.avg+', median $'+ds.median : 'Depop: no data',
+  ].join('\n');
+  const comps = ebay.slice(0,6).map((l,i) => (i+1)+'. "'+l.title+'" - $'+l.price+' ('+l.condition+')').join('\n') || 'No comps found';
+
+  const prompt = isFullListing
+    ? 'You are an expert eBay reseller using 2025 best practices. Create a complete optimized listing.\n\nItem: '+query+'\nSold price data:\n'+stats+'\neBay sold comps:\n'+comps+'\n\nReturn ONLY raw JSON:\n{"suggestedPrice":49.99,"priceRangeMin":40.00,"priceRangeMax":60.00,"title":"SEO title under 80 chars","condition":"Pre-Owned","description":"3-4 natural paragraphs like a real reseller. Condition details, whats included, shipping, Buy It Now + Best Offer. No AI tone.","hashtags":["#brand","#model"],"tips":["Promote at 3.5%","Enable Best Offer","Free shipping built in","Relist after 48hrs no views"],"platform":"recommendation with reason"}'
+    : 'You are an expert eBay reseller. Quick pricing advice.\n\nItem: '+query+'\nSold price data:\n'+stats+'\neBay sold comps:\n'+comps+'\n\nReturn ONLY raw JSON:\n{"suggestedPrice":49.99,"priceRangeMin":40.00,"priceRangeMax":60.00,"title":"SEO title under 80 chars","condition":"Pre-Owned","tips":["tip1","tip2","tip3"],"platform":"recommendation","marketNote":"one sentence on demand"}';
+
+  const r = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: isFullListing ? 1200 : 600,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const raw = r.content[0].text.trim().replace(/```json|```/g, '').trim();
+  try { return JSON.parse(raw); }
+  catch { return { suggestedPrice: '?', priceRangeMin: '?', priceRangeMax: '?', title: query, condition: 'Pre-Owned', tips: [], platform: 'eBay' }; }
 }
 
 // Quick text commands
@@ -286,10 +263,13 @@ client.on(Events.MessageCreate, async (message) => {
     const [er, dr] = await Promise.allSettled([scrapeEbay(query), scrapeDepop(query)]);
     const ebay = er.status === 'fulfilled' ? er.value : [];
     const depop = dr.status === 'fulfilled' ? dr.value : [];
-    const bestPhotos = await pickBestPhotos(ebay, query);
+    const session = getSession(message.author.id);
+    session.ebayListings = ebay.filter(l => l.itemUrl);
+    session.photoListingIndex = 0;
     const rec = await generateRec(query, ebay, depop, isFull);
     await m.delete().catch(() => {});
-    await postResults(message.channel, rec, ebay, depop, query, message.author.id, bestPhotos);
+    await sendResultsEphemeral(message.channel, rec, ebay, depop, query, message.author.id);
+    await sendPhotos(message.channel, session, message.author.id, false);
   } catch (err) { await m.edit('Error: ' + err.message); }
 });
 
