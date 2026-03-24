@@ -6,6 +6,7 @@ const { scrapeEbay, getPriceStats, fetchListingPhotos } = require('./scraper');
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const sessions = new Map();
+const dashboards = new Map(); // channelId -> msgId (one dashboard per channel)
 
 function getSession(userId) {
   if (!sessions.has(userId)) sessions.set(userId, { itemName: null, status: 'idle', msgId: null, channelId: null, photoIdx: 0, listings: [], interaction: null });
@@ -63,10 +64,13 @@ function newPhotosBtn() {
 
 // Update the public dashboard message directly via client (not interaction)
 async function refreshDashboard(session) {
-  if (!session.msgId || !session.channelId) return;
+  if (!session.channelId) return;
+  // Use global registry to find the dashboard message for this channel
+  const msgId = dashboards.get(session.channelId) || session.msgId;
+  if (!msgId) return;
   try {
     const chan = await client.channels.fetch(session.channelId);
-    const msg = await chan.messages.fetch(session.msgId).catch(() => null);
+    const msg = await chan.messages.fetch(msgId).catch(() => null);
     if (msg) await msg.edit({ embeds: [buildEmbed(session)], components: buildButtons(session) });
   } catch (e) { console.warn('Dashboard refresh failed:', e.message); }
 }
@@ -80,6 +84,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const msg = await interaction.reply({ embeds: [buildEmbed(session)], components: buildButtons(session), fetchReply: true });
     session.msgId = msg.id;
     session.channelId = interaction.channelId;
+    // Store globally so any user in this channel can trigger updates
+    dashboards.set(interaction.channelId, msg.id);
     return;
   }
 
