@@ -16,8 +16,10 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const cmds = [new SlashCommandBuilder().setName('marketdashboard').setDescription('Open the ResellBot market dashboard')].map(c => c.toJSON());
   try {
+    // Register globally so bot works in any server
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: cmds });
+    // Also register to guild for instant updates during dev
     if (process.env.GUILD_ID) await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: cmds });
-    else await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: cmds });
     console.log('Slash command registered');
   } catch (e) { console.error('Slash error:', e.message); }
 }
