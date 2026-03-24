@@ -71,12 +71,17 @@ async function scrapeEbay(query, limit = 12) {
     }
     console.log(`[eBay] Found ${imagePositions.length} images in HTML`);
 
-    // Extract eBay item URLs with their positions in HTML
+    // Extract eBay item URLs — match /itm/ITEMID anywhere in HTML
     const itemUrlPositions = [];
-    const iuPat = /href="(https:\/\/www\.ebay\.com\/itm\/(\d+)[^"]*)"/g;
+    const iuPat = /\/itm\/(\d{10,13})/g;
     let iuM;
+    const seenIds = new Set();
     while ((iuM = iuPat.exec(html)) !== null) {
-      itemUrlPositions.push({ url: 'https://www.ebay.com/itm/' + iuM[2], pos: iuM.index });
+      const id = iuM[1];
+      if (!seenIds.has(id)) {
+        seenIds.add(id);
+        itemUrlPositions.push({ url: 'https://www.ebay.com/itm/' + id, pos: iuM.index });
+      }
     }
     console.log(`[eBay] Found ${itemUrlPositions.length} item URLs`);
 
