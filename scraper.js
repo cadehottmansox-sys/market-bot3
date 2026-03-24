@@ -71,6 +71,15 @@ async function scrapeEbay(query, limit = 12) {
     }
     console.log(`[eBay] Found ${imagePositions.length} images in HTML`);
 
+    // Extract item URLs with their positions
+    const itemUrlPositions = [];
+    const itemUrlPattern = /href="(https:\/\/www\.ebay\.com\/itm\/(\d+)[^"]*)"/g;
+    let iuMatch;
+    while ((iuMatch = itemUrlPattern.exec(html)) !== null) {
+      itemUrlPositions.push({ url: 'https://www.ebay.com/itm/' + iuMatch[2], pos: iuMatch.index });
+    }
+    console.log(`[eBay] Found ${itemUrlPositions.length} item URLs in HTML`);
+
     // Convert to plain text for parsing
     const text = toPlainText(html);
 
@@ -129,7 +138,14 @@ async function scrapeEbay(query, limit = 12) {
         if (dist < bestDist) { bestDist = dist; bestImg = img.url; }
       }
 
-      items.push({ title, price, date, condition, imageUrl: bestImg, itemUrl: null, platform: 'eBay' });
+      // Find nearest item URL
+      let bestItemUrl = null;
+      let bestItemDist = Infinity;
+      for (const iu of itemUrlPositions) {
+        const dist = Math.abs(iu.pos - htmlPos);
+        if (dist < bestItemDist) { bestItemDist = dist; bestItemUrl = iu.url; }
+      }
+      items.push({ title, price, date, condition, imageUrl: bestImg, itemUrl: bestItemUrl, platform: 'eBay' });
     }
 
     console.log(`[eBay] Parsed ${items.length} sold listings`);
