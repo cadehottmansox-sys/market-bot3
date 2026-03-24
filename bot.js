@@ -6,10 +6,10 @@ const { scrapeEbay, getPriceStats, fetchListingPhotos } = require('./scraper');
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const sessions = new Map();
-const dashboards = new Map(); // channelId -> msgId (one dashboard per channel)
+const dashboards = new Map(); // channelId -> msgId
 
 function getSession(userId) {
-  if (!sessions.has(userId)) sessions.set(userId, { itemName: null, status: 'idle', msgId: null, channelId: null, photoIdx: 0, listings: [], interaction: null });
+  if (!sessions.has(userId)) sessions.set(userId, { itemName: null, msgId: null, channelId: null, photoIdx: 0, listings: [], interaction: null });
   return sessions.get(userId);
 }
 
@@ -17,9 +17,7 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const cmds = [new SlashCommandBuilder().setName('marketdashboard').setDescription('Open the ResellBot market dashboard')].map(c => c.toJSON());
   try {
-    // Global registration — works in any server (up to 1hr propagation)
     await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: cmds });
-    // Also guild for instant updates
     if (process.env.GUILD_ID) await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: cmds });
     console.log('Slash command registered');
   } catch (e) { console.error('Slash error:', e.message); }
@@ -30,29 +28,26 @@ client.once(Events.ClientReady, () => {
   if (process.env.CLIENT_ID) registerCommands().catch(console.error);
 });
 
-function buildEmbed(session) {
-  const hasItem = !!session.itemName;
+// Dashboard always shows ready state — buttons NEVER disabled globally
+function buildEmbed(itemName) {
   return new EmbedBuilder()
     .setTitle('🏷️ ResellBot — Market Analysis')
     .setDescription([
-      hasItem ? '🏷️ **Slot 1 — Item**\n✅ ' + session.itemName : '🏷️ **Slot 1 — Item Name**\n⬜ Nothing entered yet',
+      itemName ? '🏷️ **Item:** ' + itemName : '🏷️ **Slot 1 — Item Name**\n⬜ Nothing entered yet',
       '',
-      session.status === 'searching' ? '⏳ Searching eBay for recent sales...' :
-      session.status === 'done' ? '✅ Done! Results sent privately.' :
-      hasItem ? '🚀 Ready! Hit 🔍 Find Comps or 📝 Full Listing.' : '👆 Click ✏️ Enter Item to get started.',
+      itemName ? '🚀 Ready! Hit 🔍 Find Comps or 📝 Full Listing.' : '👆 Click ✏️ Enter Item to get started.',
     ].join('\n'))
-    .setColor(session.status === 'done' ? 0x00c851 : session.status === 'searching' ? 0xffaa00 : 0x5865f2)
+    .setColor(0x5865f2)
     .setFooter({ text: '💰 ResellBot • eBay Comp Finder' });
 }
 
-function buildButtons(session) {
-  const hasItem = !!session.itemName;
-  const busy = session.status === 'searching';
+// Buttons are ALWAYS enabled — each user has their own session
+function buildButtons(itemName) {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('rb_enter').setLabel(hasItem ? '✏️ Edit Item' : '✏️ Enter Item').setStyle(hasItem ? ButtonStyle.Secondary : ButtonStyle.Success).setDisabled(busy),
-    new ButtonBuilder().setCustomId('rb_comps').setLabel('🔍 Find Comps').setStyle(ButtonStyle.Danger).setDisabled(!hasItem || busy),
-    new ButtonBuilder().setCustomId('rb_listing').setLabel('📝 Full Listing').setStyle(ButtonStyle.Success).setDisabled(!hasItem || busy),
-    new ButtonBuilder().setCustomId('rb_clear').setLabel('🗑️ Clear').setStyle(ButtonStyle.Secondary).setDisabled(busy),
+    new ButtonBuilder().setCustomId('rb_enter').setLabel(itemName ? '✏️ Edit Item' : '✏️ Enter Item').setStyle(itemName ? ButtonStyle.Secondary : ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('rb_comps').setLabel('🔍 Find Comps').setStyle(ButtonStyle.Danger).setDisabled(!itemName),
+    new ButtonBuilder().setCustomId('rb_listing').setLabel('📝 Full Listing').setStyle(ButtonStyle.Success).setDisabled(!itemName),
+    new ButtonBuilder().setCustomId('rb_clear').setLabel('🗑️ Clear').setStyle(ButtonStyle.Secondary),
   )];
 }
 
@@ -62,16 +57,13 @@ function newPhotosBtn() {
   )];
 }
 
-// Update the public dashboard message directly via client (not interaction)
-async function refreshDashboard(session) {
-  if (!session.channelId) return;
-  // Use global registry to find the dashboard message for this channel
-  const msgId = dashboards.get(session.channelId) || session.msgId;
+async function refreshDashboard(channelId, itemName) {
+  const msgId = dashboards.get(channelId);
   if (!msgId) return;
   try {
-    const chan = await client.channels.fetch(session.channelId);
+    const chan = await client.channels.fetch(channelId);
     const msg = await chan.messages.fetch(msgId).catch(() => null);
-    if (msg) await msg.edit({ embeds: [buildEmbed(session)], components: buildButtons(session) });
+    if (msg) await msg.edit({ embeds: [buildEmbed(itemName)], components: buildButtons(itemName) });
   } catch (e) { console.warn('Dashboard refresh failed:', e.message); }
 }
 
@@ -79,17 +71,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const userId = interaction.user.id;
   const session = getSession(userId);
 
-  // /marketdashboard — PUBLIC permanent dashboard
+  // /marketdashboard — post permanent public dashboard
   if (interaction.isChatInputCommand() && interaction.commandName === 'marketdashboard') {
-    const msg = await interaction.reply({ embeds: [buildEmbed(session)], components: buildButtons(session), fetchReply: true });
-    session.msgId = msg.id;
-    session.channelId = interaction.channelId;
-    // Store globally so any user in this channel can trigger updates
+    const msg = await interaction.reply({ embeds: [buildEmbed(null)], components: buildButtons(null), fetchReply: true });
     dashboards.set(interaction.channelId, msg.id);
     return;
   }
 
-  // Enter item button — shows modal (no message sent)
+  // Enter item button
   if (interaction.isButton() && interaction.customId === 'rb_enter') {
     const modal = new ModalBuilder().setCustomId('rb_modal').setTitle('✏️ Enter Item Details');
     modal.addComponents(new ActionRowBuilder().addComponents(
@@ -100,26 +89,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.showModal(modal);
   }
 
-  // Modal submit — EPHEMERAL confirmation + update public dashboard via direct edit
+  // Modal submit — ephemeral ack + update dashboard
   if (interaction.isModalSubmit() && interaction.customId === 'rb_modal') {
     session.itemName = interaction.fields.fields.get('item')?.value?.trim() || '';
-    session.status = 'idle'; session.photoIdx = 0; session.listings = [];
     session.channelId = interaction.channelId;
-    // Ephemeral reply — only the user who typed sees this
-    await interaction.reply({ content: '✅ Item set to **' + session.itemName + '**! Now hit 🔍 Find Comps or 📝 Full Listing on the dashboard above.', ephemeral: true });
-    // Update the public dashboard separately
-    await refreshDashboard(session);
+    session.photoIdx = 0;
+    session.listings = [];
+    await interaction.reply({ content: '✅ Item set to **' + session.itemName + '**! Now hit 🔍 Find Comps or 📝 Full Listing.', ephemeral: true });
+    await refreshDashboard(interaction.channelId, session.itemName);
     return;
   }
 
-  // Clear — updates the public dashboard
+  // Clear
   if (interaction.isButton() && interaction.customId === 'rb_clear') {
-    session.itemName = null; session.status = 'idle'; session.listings = []; session.photoIdx = 0;
-    await interaction.update({ embeds: [buildEmbed(session)], components: buildButtons(session) });
+    session.itemName = null; session.listings = []; session.photoIdx = 0;
+    await interaction.deferUpdate();
+    await refreshDashboard(interaction.channelId, null);
     return;
   }
 
-  // New photos — EPHEMERAL
+  // New photos
   if (interaction.isButton() && interaction.customId === 'rb_newphotos') {
     session.photoIdx = (session.photoIdx || 0) + 1;
     await interaction.deferUpdate();
@@ -127,18 +116,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // Find Comps / Full Listing — update public dashboard, results all EPHEMERAL
+  // Find Comps / Full Listing
   if (interaction.isButton() && (interaction.customId === 'rb_comps' || interaction.customId === 'rb_listing')) {
     const isFullListing = interaction.customId === 'rb_listing';
-    session.status = 'searching'; session.photoIdx = 0; session.listings = [];
     session.interaction = interaction;
     session.channelId = interaction.channelId;
-    // Update public dashboard to show "Searching..."
-    await interaction.update({ embeds: [buildEmbed(session)], components: buildButtons(session) });
+    // ACK button, don't update dashboard — keep it usable for others
+    await interaction.deferUpdate();
     runSearch(userId, isFullListing).catch(async err => {
       console.error('Search error:', err.message);
-      session.status = 'idle';
-      await refreshDashboard(session);
       await session.interaction.followUp({ content: '❌ Error: ' + err.message, ephemeral: true }).catch(() => {});
     });
   }
@@ -151,10 +137,6 @@ async function runSearch(userId, isFullListing) {
   console.log('eBay listings: ' + ebay.length);
   session.listings = ebay.filter(l => l.itemUrl);
   const rec = await generateRec(query, ebay, isFullListing);
-  session.status = 'done';
-  // Update public dashboard to "Done"
-  await refreshDashboard(session);
-  // All results EPHEMERAL — only the requester sees them
   await sendResults(session, rec, ebay, query);
   await sendPhotos(session);
 }
@@ -176,7 +158,6 @@ async function sendResults(session, rec, ebay, query) {
   const e2 = new EmbedBuilder().setTitle('📦 eBay — Recent Sold').setColor(0xe53238)
     .setDescription(ebay.length ? ebay.slice(0, 8).map((l, i) => '**' + (i+1) + '.** $' + l.price + ' — ' + l.title.slice(0, 55) + ' *(' + l.condition + ')*').join('\n') : '_No eBay results_')
     .setFooter({ text: es ? 'Avg $' + es.avg + ' • Median $' + es.median + ' • ' + es.count + ' sales' : 'No data' });
-  // EPHEMERAL — only requester sees
   await session.interaction.followUp({ embeds: [e1, e2], ephemeral: true });
   if (rec.description) {
     const e3 = new EmbedBuilder().setTitle('📋 Copy-Paste Listing').setColor(0x5865f2)
@@ -195,7 +176,7 @@ async function sendPhotos(session) {
     return;
   }
   const listing = listings[idx];
-  console.log('Fetching photos from listing ' + (idx + 1) + ': ' + listing.itemUrl);
+  console.log('Fetching photos from listing ' + (idx+1) + ': ' + listing.itemUrl);
   const photos = await fetchListingPhotos(listing.itemUrl).catch(() => []);
   if (photos.length === 0) { session.photoIdx = idx + 1; return sendPhotos(session); }
   const photoEmbeds = photos.slice(0, 4).map((url, i) =>
@@ -203,7 +184,7 @@ async function sendPhotos(session) {
       .setTitle(i === 0 ? '📸 ' + listing.title.slice(0, 45) + ' — Sold $' + listing.price : '\u200b')
       .setDescription(i === 0 ? 'All photos from one sold listing. Hit 🔄 for a different listing.' : null)
       .setImage(url).setColor(0x2b2d31)
-      .setFooter({ text: 'Photo ' + (i + 1) + ' of ' + Math.min(photos.length, 4) + ' • Only you can see this' })
+      .setFooter({ text: 'Photo ' + (i+1) + ' of ' + Math.min(photos.length, 4) + ' • Only you can see this' })
   );
   await session.interaction.followUp({ embeds: photoEmbeds, components: newPhotosBtn(), ephemeral: true });
 }
