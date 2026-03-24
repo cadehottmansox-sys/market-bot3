@@ -16,8 +16,10 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const cmds = [new SlashCommandBuilder().setName('marketdashboard').setDescription('Open the ResellBot market dashboard')].map(c => c.toJSON());
   try {
+    // Global registration — works in any server (up to 1hr propagation)
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: cmds });
+    // Also guild for instant updates
     if (process.env.GUILD_ID) await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: cmds });
-    else await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: cmds });
     console.log('Slash command registered');
   } catch (e) { console.error('Slash error:', e.message); }
 }
@@ -59,10 +61,21 @@ function newPhotosBtn() {
   )];
 }
 
+// Update the public dashboard message directly via client (not interaction)
+async function refreshDashboard(session) {
+  if (!session.msgId || !session.channelId) return;
+  try {
+    const chan = await client.channels.fetch(session.channelId);
+    const msg = await chan.messages.fetch(session.msgId).catch(() => null);
+    if (msg) await msg.edit({ embeds: [buildEmbed(session)], components: buildButtons(session) });
+  } catch (e) { console.warn('Dashboard refresh failed:', e.message); }
+}
+
 client.on(Events.InteractionCreate, async (interaction) => {
   const userId = interaction.user.id;
   const session = getSession(userId);
 
+  // /marketdashboard — PUBLIC permanent dashboard
   if (interaction.isChatInputCommand() && interaction.commandName === 'marketdashboard') {
     const msg = await interaction.reply({ embeds: [buildEmbed(session)], components: buildButtons(session), fetchReply: true });
     session.msgId = msg.id;
@@ -70,6 +83,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // Enter item button — shows modal (no message sent)
   if (interaction.isButton() && interaction.customId === 'rb_enter') {
     const modal = new ModalBuilder().setCustomId('rb_modal').setTitle('✏️ Enter Item Details');
     modal.addComponents(new ActionRowBuilder().addComponents(
@@ -80,27 +94,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.showModal(modal);
   }
 
+  // Modal submit — EPHEMERAL confirmation + update public dashboard via direct edit
   if (interaction.isModalSubmit() && interaction.customId === 'rb_modal') {
     session.itemName = interaction.fields.fields.get('item')?.value?.trim() || '';
     session.status = 'idle'; session.photoIdx = 0; session.listings = [];
     session.channelId = interaction.channelId;
-    // Ephemeral confirmation — only the user sees this
-    await interaction.reply({ content: '✅ Item set to **' + session.itemName + '**! Hit 🔍 Find Comps or 📝 Full Listing on the dashboard.', ephemeral: true });
-    // Update the public dashboard separately via direct message fetch
-    const chan2 = await client.channels.fetch(session.channelId);
-    if (session.msgId) {
-      const dashMsg = await chan2.messages.fetch(session.msgId).catch(() => null);
-      if (dashMsg) dashMsg.edit({ embeds: [buildEmbed(session)], components: buildButtons(session) }).catch(() => {});
-    }
+    // Ephemeral reply — only the user who typed sees this
+    await interaction.reply({ content: '✅ Item set to **' + session.itemName + '**! Now hit 🔍 Find Comps or 📝 Full Listing on the dashboard above.', ephemeral: true });
+    // Update the public dashboard separately
+    await refreshDashboard(session);
     return;
   }
 
+  // Clear — updates the public dashboard
   if (interaction.isButton() && interaction.customId === 'rb_clear') {
     session.itemName = null; session.status = 'idle'; session.listings = []; session.photoIdx = 0;
     await interaction.update({ embeds: [buildEmbed(session)], components: buildButtons(session) });
     return;
   }
 
+  // New photos — EPHEMERAL
   if (interaction.isButton() && interaction.customId === 'rb_newphotos') {
     session.photoIdx = (session.photoIdx || 0) + 1;
     await interaction.deferUpdate();
@@ -108,17 +121,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // Find Comps / Full Listing — update public dashboard, results all EPHEMERAL
   if (interaction.isButton() && (interaction.customId === 'rb_comps' || interaction.customId === 'rb_listing')) {
     const isFullListing = interaction.customId === 'rb_listing';
-    session.status = 'searching';
-    session.photoIdx = 0;
-    session.listings = [];
+    session.status = 'searching'; session.photoIdx = 0; session.listings = [];
     session.interaction = interaction;
     session.channelId = interaction.channelId;
+    // Update public dashboard to show "Searching..."
     await interaction.update({ embeds: [buildEmbed(session)], components: buildButtons(session) });
     runSearch(userId, isFullListing).catch(async err => {
       console.error('Search error:', err.message);
       session.status = 'idle';
+      await refreshDashboard(session);
       await session.interaction.followUp({ content: '❌ Error: ' + err.message, ephemeral: true }).catch(() => {});
     });
   }
@@ -127,29 +141,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
 async function runSearch(userId, isFullListing) {
   const session = getSession(userId);
   const query = session.itemName;
-
   const ebay = await scrapeEbay(query).catch(() => []);
   console.log('eBay listings: ' + ebay.length);
-
   session.listings = ebay.filter(l => l.itemUrl);
   const rec = await generateRec(query, ebay, isFullListing);
   session.status = 'done';
-
-  // Update the public dashboard
-  const chan = await client.channels.fetch(session.channelId);
-  if (session.msgId) {
-    const msg = await chan.messages.fetch(session.msgId).catch(() => null);
-    if (msg) msg.edit({ embeds: [buildEmbed(session)], components: buildButtons(session) }).catch(() => {});
-  }
-
-  // Send results + photos as ephemeral via followUp — ONLY visible to requester
+  // Update public dashboard to "Done"
+  await refreshDashboard(session);
+  // All results EPHEMERAL — only the requester sees them
   await sendResults(session, rec, ebay, query);
   await sendPhotos(session);
 }
 
 async function sendResults(session, rec, ebay, query) {
   const es = getPriceStats(ebay);
-
   const e1 = new EmbedBuilder()
     .setTitle('💰 ' + query.slice(0, 50))
     .setColor(0x00c851)
@@ -162,15 +167,11 @@ async function sendResults(session, rec, ebay, query) {
     ).setTimestamp().setFooter({ text: ebay.length + ' eBay comps • Only you can see this' });
   if (rec.marketNote) e1.addFields({ name: '📈 Market Note', value: rec.marketNote });
   if (rec.tips?.length) e1.addFields({ name: '💡 Tips', value: rec.tips.map(t => '• ' + t).join('\n') });
-
   const e2 = new EmbedBuilder().setTitle('📦 eBay — Recent Sold').setColor(0xe53238)
-    .setDescription(ebay.length
-      ? ebay.slice(0, 8).map((l, i) => '**' + (i+1) + '.** $' + l.price + ' — ' + l.title.slice(0, 55) + ' *(' + l.condition + ')*').join('\n')
-      : '_No eBay results_')
+    .setDescription(ebay.length ? ebay.slice(0, 8).map((l, i) => '**' + (i+1) + '.** $' + l.price + ' — ' + l.title.slice(0, 55) + ' *(' + l.condition + ')*').join('\n') : '_No eBay results_')
     .setFooter({ text: es ? 'Avg $' + es.avg + ' • Median $' + es.median + ' • ' + es.count + ' sales' : 'No data' });
-
+  // EPHEMERAL — only requester sees
   await session.interaction.followUp({ embeds: [e1, e2], ephemeral: true });
-
   if (rec.description) {
     const e3 = new EmbedBuilder().setTitle('📋 Copy-Paste Listing').setColor(0x5865f2)
       .setDescription('```\n' + rec.description.slice(0, 3900) + '\n```');
@@ -182,31 +183,22 @@ async function sendResults(session, rec, ebay, query) {
 async function sendPhotos(session) {
   const listings = (session.listings || []).filter(l => l.itemUrl);
   if (listings.length === 0) return;
-
   const idx = session.photoIdx || 0;
   if (idx >= listings.length) {
     await session.interaction.followUp({ content: '📷 No more listings to try!', ephemeral: true }).catch(() => {});
     return;
   }
-
   const listing = listings[idx];
   console.log('Fetching photos from listing ' + (idx + 1) + ': ' + listing.itemUrl);
   const photos = await fetchListingPhotos(listing.itemUrl).catch(() => []);
-
-  if (photos.length === 0) {
-    session.photoIdx = idx + 1;
-    return sendPhotos(session);
-  }
-
+  if (photos.length === 0) { session.photoIdx = idx + 1; return sendPhotos(session); }
   const photoEmbeds = photos.slice(0, 4).map((url, i) =>
     new EmbedBuilder()
       .setTitle(i === 0 ? '📸 ' + listing.title.slice(0, 45) + ' — Sold $' + listing.price : '\u200b')
-      .setDescription(i === 0 ? 'All photos from one sold listing. Hit 🔄 for different listing photos.' : null)
-      .setImage(url)
-      .setColor(0x2b2d31)
+      .setDescription(i === 0 ? 'All photos from one sold listing. Hit 🔄 for a different listing.' : null)
+      .setImage(url).setColor(0x2b2d31)
       .setFooter({ text: 'Photo ' + (i + 1) + ' of ' + Math.min(photos.length, 4) + ' • Only you can see this' })
   );
-
   await session.interaction.followUp({ embeds: photoEmbeds, components: newPhotosBtn(), ephemeral: true });
 }
 
@@ -214,16 +206,10 @@ async function generateRec(query, ebay, isFullListing) {
   const es = getPriceStats(ebay);
   const stats = es ? 'eBay: avg $' + es.avg + ', median $' + es.median + ', range $' + es.min + '-$' + es.max + ' (' + es.count + ' sales)' : 'eBay: no data';
   const comps = ebay.slice(0, 6).map((l, i) => (i+1) + '. "' + l.title + '" - $' + l.price + ' (' + l.condition + ')').join('\n') || 'No comps';
-
   const prompt = isFullListing
     ? 'Expert eBay reseller, 2025 best practices. Full listing for: ' + query + '\nData: ' + stats + '\nComps:\n' + comps + '\nReturn ONLY raw JSON:\n{"suggestedPrice":49.99,"priceRangeMin":40.00,"priceRangeMax":60.00,"title":"SEO title under 80 chars","condition":"Pre-Owned","description":"3-4 natural paragraphs. Condition details, whats included, shipping, Buy It Now + Best Offer. Real seller tone.","hashtags":["#tag"],"tips":["Promote 3.5%","Best Offer on","Free shipping built in","Relist after 48hrs no views"],"platform":"recommendation with reason"}'
     : 'Expert eBay reseller. Quick pricing for: ' + query + '\nData: ' + stats + '\nComps:\n' + comps + '\nReturn ONLY raw JSON:\n{"suggestedPrice":49.99,"priceRangeMin":40.00,"priceRangeMax":60.00,"title":"SEO title under 80 chars","condition":"Pre-Owned","tips":["tip1","tip2","tip3"],"platform":"recommendation","marketNote":"one sentence on demand"}';
-
-  const r = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: isFullListing ? 1200 : 600,
-    messages: [{ role: 'user', content: prompt }],
-  });
+  const r = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: isFullListing ? 1200 : 600, messages: [{ role: 'user', content: prompt }] });
   const raw = r.content[0].text.trim().replace(/```json|```/g, '').trim();
   try { return JSON.parse(raw); }
   catch { return { suggestedPrice: '?', priceRangeMin: '?', priceRangeMax: '?', title: query, condition: 'Pre-Owned', tips: [], platform: 'eBay' }; }
