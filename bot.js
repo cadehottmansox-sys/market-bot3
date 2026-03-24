@@ -16,10 +16,8 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const cmds = [new SlashCommandBuilder().setName('marketdashboard').setDescription('Open the ResellBot market dashboard')].map(c => c.toJSON());
   try {
-    // Register globally so bot works in any server
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: cmds });
-    // Also register to guild for instant updates during dev
     if (process.env.GUILD_ID) await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: cmds });
+    else await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: cmds });
     console.log('Slash command registered');
   } catch (e) { console.error('Slash error:', e.message); }
 }
@@ -86,8 +84,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     session.itemName = interaction.fields.fields.get('item')?.value?.trim() || '';
     session.status = 'idle'; session.photoIdx = 0; session.listings = [];
     session.channelId = interaction.channelId;
-    const msg = await interaction.reply({ embeds: [buildEmbed(session)], components: buildButtons(session), fetchReply: true });
-    session.msgId = msg.id;
+    // Ephemeral confirmation — only the user sees this
+    await interaction.reply({ content: '✅ Item set to **' + session.itemName + '**! Hit 🔍 Find Comps or 📝 Full Listing on the dashboard.', ephemeral: true });
+    // Update the public dashboard separately via direct message fetch
+    const chan2 = await client.channels.fetch(session.channelId);
+    if (session.msgId) {
+      const dashMsg = await chan2.messages.fetch(session.msgId).catch(() => null);
+      if (dashMsg) dashMsg.edit({ embeds: [buildEmbed(session)], components: buildButtons(session) }).catch(() => {});
+    }
     return;
   }
 
